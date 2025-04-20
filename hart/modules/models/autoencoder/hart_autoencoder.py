@@ -214,13 +214,27 @@ class HARTAutoEncoder(PreTrainedModel):
         v_patch_nums: Optional[Sequence[Union[int, Tuple[int, int]]]] = None,
         exception_stages: Optional[Dict[int, torch.Tensor]] = None,
     ) -> List[torch.LongTensor]:  # return List[Bl]
+        # Ensure we're using float32 for the encoder operations
+        # This is critical for compatibility with the quantization operations
+        original_dtype = inp_img_no_grad.dtype
+        inp_img_no_grad = inp_img_no_grad.to(torch.float32)
+        
+        # Run the image through encoder and quantization conv
         f = self.quant_conv(self.encoder(inp_img_no_grad))
-        return self.quantize.f_to_idxBl_or_fhat(
+        
+        # Make sure quantization can work by ensuring same dtype as embedding weights
+        if f.dtype != self.quantize.embedding.weight.dtype:
+            f = f.to(self.quantize.embedding.weight.dtype)
+            
+        # Process through quantizer
+        result = self.quantize.f_to_idxBl_or_fhat(
             f,
             to_fhat=False,
             v_patch_nums=v_patch_nums,
             exception_stages=exception_stages,
         )
+        
+        return result
 
     def img_to_idxBl_and_frest(
         self,

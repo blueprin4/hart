@@ -343,11 +343,18 @@ class HARTForT2I(PreTrainedModel):
         if input_image is not None:
             # Normalize input image from [0,1] to [-1,1]
             input_image_normalized = input_image.mul(2).sub(1)
+            
+            # Ensure input tensor has the same dtype as model parameters (float32)
+            # This is critical because the autoencoder's mat operations require consistent dtypes
+            input_image_normalized = input_image_normalized.to(dtype=torch.float32)
+            
             # Encode the input image through the VAE
             with torch.inference_mode():
                 # Access the autoencoder from the model
                 autoencoder = self.vae_proxy[0]
+                
                 # Process the image through encoder and quantizer
+                # The autoencoder expects float32 input
                 input_image_tokens = autoencoder.img_to_idxBl(
                     input_image_normalized, v_patch_nums=self.patch_nums
                 )

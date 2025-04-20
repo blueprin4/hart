@@ -1,0 +1,33 @@
+
+error:
+```
+  File "/usr/local/lib/python3.10/dist-packages/gradio/queueing.py", line 625, in process_events
+    response = await route_utils.call_process_api(
+  File "/usr/local/lib/python3.10/dist-packages/gradio/route_utils.py", line 322, in call_process_api
+    output = await app.get_blocks().process_api(
+  File "/usr/local/lib/python3.10/dist-packages/gradio/blocks.py", line 2136, in process_api
+    result = await self.call_function(
+  File "/usr/local/lib/python3.10/dist-packages/gradio/blocks.py", line 1662, in call_function
+    prediction = await anyio.to_thread.run_sync(  # type: ignore
+  File "/usr/local/lib/python3.10/dist-packages/anyio/to_thread.py", line 56, in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+  File "/usr/local/lib/python3.10/dist-packages/anyio/_backends/_asyncio.py", line 2134, in run_sync_in_worker_thread
+    return await future
+  File "/usr/local/lib/python3.10/dist-packages/anyio/_backends/_asyncio.py", line 851, in run
+    result = context.run(func, *args)
+  File "/usr/local/lib/python3.10/dist-packages/gradio/utils.py", line 883, in wrapper
+    response = f(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/gradio/utils.py", line 883, in wrapper
+    response = f(*args, **kwargs)
+  File "/workspace/hart/app.py", line 186, in generate_img2img
+    output_imgs = infer_func(
+  File "/usr/local/lib/python3.10/dist-packages/torch/utils/_contextlib.py", line 115, in decorate_context
+    return func(*args, **kwargs)
+  File "/workspace/hart/hart/modules/models/transformer/hart_transformer_t2i.py", line 351, in autoregressive_infer_cfg
+    input_image_tokens = autoencoder.img_to_idxBl(
+  File "/workspace/hart/hart/modules/models/autoencoder/hart_autoencoder.py", line 218, in img_to_idxBl
+    return self.quantize.f_to_idxBl_or_fhat(
+  File "/workspace/hart/hart/modules/models/autoencoder/quantize/var_quantize_multiple_res.py", line 296, in f_to_idxBl_or_fhat
+    d_no_grad.addmm_(
+RuntimeError: mat1 and mat2 must have the same dtype, but got Half and Float
+```

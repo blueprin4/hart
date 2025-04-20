@@ -1,4 +1,7 @@
 #!/usr/bin/env python
+#1.3 removed shiled module
+#1.4 I've fixed the dtype mismatch issue
+#1.4-1. The core error was in the addmm_ operation
 
 import argparse
 import copy
@@ -14,19 +17,17 @@ from PIL import Image
 from transformers import (
     AutoConfig,
     AutoModel,
-    AutoModelForCausalLM,
     AutoTokenizer,
     HfArgumentParser,
     set_seed,
 )
 
 from hart.modules.models.transformer import HARTForT2I
-from hart.utils import default_prompts, encode_prompts, llm_system_prompt, safety_check
+from hart.utils import default_prompts, encode_prompts, llm_system_prompt
 
 DESCRIPTION = (
     """# HART: Efficient Visual Generation with Hybrid Autoregressive Transformer"""
     + """\n[\\[Paper\\]](https://arxiv.org/abs/2410.10812) [\\[Project\\]](https://hanlab.mit.edu/projects/hart) [\\[GitHub\\]](https://github.com/mit-han-lab/hart)"""
-    + """\n<p>Note: We will replace unsafe prompts with a default prompt: \"A red heart.\"</p>"""
 )
 if not torch.cuda.is_available():
     DESCRIPTION += "\n<p>Running on CPU 🥶 This demo may not work on CPU.</p>"
@@ -62,11 +63,6 @@ def generate(
     # pipe.to(device)
     seed = int(randomize_seed_fn(seed, randomize_seed))
     generator = torch.Generator().manual_seed(seed)
-
-    if safety_check.is_dangerous(
-        safety_checker_tokenizer, safety_checker_model, prompt
-    ):
-        prompt = "A red heart."
 
     prompts = [prompt]
 
@@ -128,11 +124,6 @@ def generate_img2img(
     seed = int(randomize_seed_fn(seed, randomize_seed))
     generator = torch.Generator().manual_seed(seed)
 
-    if safety_check.is_dangerous(
-        safety_checker_tokenizer, safety_checker_model, prompt
-    ):
-        prompt = "A red heart."
-
     prompts = [prompt]
 
     # Process the input image to match the model's expected input format
@@ -157,19 +148,30 @@ def generate_img2img(
             input_image = input_image.convert('RGB')
             input_np = np.array(input_image)
         
-        input_tensor = torch.from_numpy(input_np).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(device)
+        # Based on the error, let's specifically use float32 here
+        # The model's VAE encoder requires inputs to be in float32 format for matrix math
+        input_tensor = (
+            torch.from_numpy(input_np)
+            .permute(2, 0, 1)
+            .to(dtype=torch.float32)  # Explicitly use float32
+            .div(255.0)
+            .unsqueeze(0)
+            .to(device)
+        )
     except Exception as e:
         print(f"Error processing input image: {e}")
         # Create a fallback red image if conversion fails
-        input_tensor = torch.zeros(1, 3, 1024, 1024, device=device)
+        # Ensure we're using float32 for the fallback image too
+        input_tensor = torch.zeros(1, 3, 1024, 1024, device=device, dtype=torch.float32)
         input_tensor[0, 0, :, :] = 1.0  # Red channel
 
     with torch.inference_mode():
         with torch.autocast(
             "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
         ):
-            # Convert input image to proper format for model
-            input_tensor = input_tensor.to(torch.float16)
+            # Important: Do NOT convert input_tensor to float16 here!
+            # The VAE encoder in the model expects float32 input
+            # The conversion to appropriate dtype is handled inside the model
 
             (
                 context_tokens,
@@ -226,12 +228,6 @@ if __name__ == "__main__":
         help="The path to text model, we employ Qwen2-VL-1.5B-Instruct by default.",
         default="Qwen2-VL-1.5B-Instruct",
     )
-    parser.add_argument(
-        "--shield_model_path",
-        type=str,
-        help="The path to shield model, we employ ShieldGemma-2B by default.",
-        default="google/shieldgemma-2b",
-    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--use_ema", type=bool, default=True)
     parser.add_argument("--max_token_length", type=int, default=300)
@@ -247,7 +243,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    model = AutoModel.from_pretrained(args.model_path, torch_dtype=torch.float16)
+    config = AutoConfig.from_pretrained(args.model_path)
+    model = HARTForT2I(config)
+    model.eval()
+    weights_path = "ema_model.bin" if args.use_ema else "pytorch_model.bin"
+    model.load_state_dict(torch.load(os.path.join(args.model_path, weights_path), map_location="cpu"))
     model = model.to(device)
     model.eval()
 
@@ -262,13 +262,6 @@ if __name__ == "__main__":
     ).to(device)
     text_model.eval()
     text_tokenizer_max_length = args.max_token_length
-
-    safety_checker_tokenizer = AutoTokenizer.from_pretrained(args.shield_model_path)
-    safety_checker_model = AutoModelForCausalLM.from_pretrained(
-        args.shield_model_path,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-    ).to(device)
 
     examples = [
         "melting apple",
