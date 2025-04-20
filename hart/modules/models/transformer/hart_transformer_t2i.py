@@ -312,6 +312,8 @@ class HARTForT2I(PreTrainedModel):
         context_mask: torch.Tensor = None,
         final_stage=0,
         num_maskgit_iters=1,
+        input_image: Optional[torch.Tensor] = None,
+        condition_scale: float = 0.7,
     ) -> torch.Tensor:  # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -322,6 +324,8 @@ class HARTForT2I(PreTrainedModel):
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
+        :param input_image: optional input image for image-to-image generation
+        :param condition_scale: how strongly to condition on the input image (0-1)
         :return: if returns_vemb: list of embedding h_BChw := vae_embed(idx_Bl), else: list of idx_Bl
         """
         # num_maskgit_iters = 1
@@ -333,6 +337,20 @@ class HARTForT2I(PreTrainedModel):
             rng = self.rng
         assert label_B is not None
         assert label_B.shape[1] == self.context_token
+
+        # Get initial image tokens if we're doing image-to-image
+        input_image_tokens = None
+        if input_image is not None:
+            # Normalize input image from [0,1] to [-1,1]
+            input_image_normalized = input_image.mul(2).sub(1)
+            # Encode the input image through the VAE
+            with torch.inference_mode():
+                # Access the autoencoder from the model
+                autoencoder = self.vae_proxy[0]
+                # Process the image through encoder and quantizer
+                input_image_tokens = autoencoder.img_to_idxBl(
+                    input_image_normalized, v_patch_nums=self.patch_nums
+                )
 
         sos = cond_BD = self.context_embed(
             self.context_norm(
@@ -403,6 +421,8 @@ class HARTForT2I(PreTrainedModel):
             if si == 0:
                 logits_BlV = logits_BlV[:, [-1], :]
 
+            # Handle image-to-image conditioning if input image is provided
+            # Sample from logits for this stage
             idx_Bl = sample_with_top_k_top_p_(
                 logits_BlV,
                 rng=rng,
@@ -410,6 +430,40 @@ class HARTForT2I(PreTrainedModel):
                 top_p=top_p,
                 num_samples=1,
             )[:, :, 0]
+            
+            # Apply image-to-image conditioning if input image is provided
+            if input_image is not None and si < len(input_image_tokens):
+                # Get input image tokens for this stage
+                input_idx_Bl = input_image_tokens[si]
+                
+                # Explicit dimension checking to ensure compatibility
+                if (idx_Bl.ndim == input_idx_Bl.ndim and 
+                    idx_Bl.shape[0] == input_idx_Bl.shape[0] and 
+                    idx_Bl.shape[1] == input_idx_Bl.shape[1]):
+                    
+                    # Blend tokens based on condition_scale
+                    use_input_mask = torch.rand(idx_Bl.shape, device=idx_Bl.device) < condition_scale
+                    idx_Bl = torch.where(use_input_mask, input_idx_Bl, idx_Bl)
+                
+                else:
+                    # Log detailed shape information for debugging
+                    print(f"Shape mismatch at stage {si}:")
+                    print(f"  Generated tokens: shape={idx_Bl.shape}, dtype={idx_Bl.dtype}, device={idx_Bl.device}")
+                    print(f"  Input image tokens: shape={input_idx_Bl.shape}, dtype={input_idx_Bl.dtype}, device={input_idx_Bl.device}")
+                    
+                    # Try to handle common mismatches (such as batch size differences)
+                    if idx_Bl.ndim == input_idx_Bl.ndim and idx_Bl.shape[1] == input_idx_Bl.shape[1]:
+                        # If only batch dimension differs, try to adapt
+                        adapted_input = input_idx_Bl
+                        if idx_Bl.shape[0] > input_idx_Bl.shape[0]:
+                            # Repeat the input to match batch size
+                            adapted_input = input_idx_Bl.repeat(idx_Bl.shape[0] // input_idx_Bl.shape[0], 1)
+                            print(f"  Adapted input tokens by repeating to shape: {adapted_input.shape}")
+                            
+                            # Now blend with adapted shape
+                            use_input_mask = torch.rand(idx_Bl.shape, device=idx_Bl.device) < condition_scale
+                            idx_Bl = torch.where(use_input_mask, adapted_input, idx_Bl)
+            
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
             else:  # not used when evaluating FID/IS/Precision/Recall
@@ -487,6 +541,55 @@ class HARTForT2I(PreTrainedModel):
                 top_p=top_p,
                 num_samples=1,
             )[:, :, 0]
+            
+            # Apply image-to-image conditioning for MaskGIT phase if input image is provided
+            if input_image is not None and len(input_image_tokens) > 0:
+                # Get the last layer of image tokens
+                input_idx_Bl = input_image_tokens[-1]
+                
+                # Explicit dimension checking to ensure compatibility
+                if (idx_Bl.ndim == input_idx_Bl.ndim and 
+                    idx_Bl.shape[0] == input_idx_Bl.shape[0] and 
+                    idx_Bl.shape[1] == input_idx_Bl.shape[1]):
+                    
+                    # Select which tokens to replace based on condition_scale
+                    # Use lower condition scale for final refinement to allow more creativity
+                    local_condition_scale = condition_scale * 0.7
+                    use_input_mask = torch.rand(idx_Bl.shape, device=idx_Bl.device) < local_condition_scale
+                    idx_Bl = torch.where(use_input_mask, input_idx_Bl, idx_Bl)
+                
+                else:
+                    # Log detailed shape information for debugging
+                    print(f"MaskGIT stage shape mismatch:")
+                    print(f"  Generated tokens: shape={idx_Bl.shape}, dtype={idx_Bl.dtype}, device={idx_Bl.device}")
+                    print(f"  Input image tokens: shape={input_idx_Bl.shape}, dtype={input_idx_Bl.dtype}, device={input_idx_Bl.device}")
+                    
+                    # Try to handle common mismatches
+                    if idx_Bl.ndim == input_idx_Bl.ndim:
+                        # If dimensions are the same but shapes differ
+                        if idx_Bl.shape[1] == input_idx_Bl.shape[1]:
+                            # If only batch dimension differs, try to adapt
+                            if idx_Bl.shape[0] > input_idx_Bl.shape[0] and idx_Bl.shape[0] % input_idx_Bl.shape[0] == 0:
+                                # Repeat input tokens to match the batch size
+                                repeat_factor = idx_Bl.shape[0] // input_idx_Bl.shape[0]
+                                adapted_input = input_idx_Bl.repeat(repeat_factor, 1)
+                                print(f"  Adapted input tokens by repeating to shape: {adapted_input.shape}")
+                                
+                                # Now blend with adapted shape
+                                local_condition_scale = condition_scale * 0.7
+                                use_input_mask = torch.rand(idx_Bl.shape, device=idx_Bl.device) < local_condition_scale
+                                idx_Bl = torch.where(use_input_mask, adapted_input, idx_Bl)
+                        
+                        elif idx_Bl.shape[1] < input_idx_Bl.shape[1]:
+                            # If the input has more tokens than needed, truncate it
+                            adapted_input = input_idx_Bl[:, :idx_Bl.shape[1]]
+                            print(f"  Adapted input tokens by truncating to shape: {adapted_input.shape}")
+                            
+                            # Now blend with adapted shape
+                            local_condition_scale = condition_scale * 0.7
+                            use_input_mask = torch.rand(idx_Bl.shape, device=idx_Bl.device) < local_condition_scale
+                            idx_Bl = torch.where(use_input_mask, adapted_input, idx_Bl)
+                
             if not more_smooth:  # this is the default case
                 h_BChw = self.vae_quant_proxy[0].embedding(idx_Bl)  # B, l, Cvae
             else:  # not used when evaluating FID/IS/Precision/Recall

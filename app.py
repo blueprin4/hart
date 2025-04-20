@@ -114,6 +114,104 @@ def generate(
     return images, seed
 
 
+@spaces.GPU(enable_queue=True)
+def generate_img2img(
+    prompt: str,
+    input_image: Image.Image,
+    condition_scale: float = 0.7,
+    seed: int = 0,
+    guidance_scale: float = 4.5,
+    randomize_seed: bool = False,
+    progress=gr.Progress(track_tqdm=True),
+):
+    global text_model, text_tokenizer
+    seed = int(randomize_seed_fn(seed, randomize_seed))
+    generator = torch.Generator().manual_seed(seed)
+
+    if safety_check.is_dangerous(
+        safety_checker_tokenizer, safety_checker_model, prompt
+    ):
+        prompt = "A red heart."
+
+    prompts = [prompt]
+
+    # Process the input image to match the model's expected input format
+    # HART model expects 1024x1024 resolution images
+    if input_image.mode != 'RGB':
+        input_image = input_image.convert('RGB')
+    
+    # Handle different versions of Pillow (PIL)
+    try:
+        # For newer Pillow versions
+        input_image = input_image.resize((1024, 1024), Image.Resampling.LANCZOS)
+    except (AttributeError, ImportError):
+        # For older Pillow versions
+        input_image = input_image.resize((1024, 1024), Image.LANCZOS)
+    
+    # Convert to tensor [B, C, H, W] and normalize to [0, 1]
+    # Handle potential errors in numpy conversion
+    try:
+        input_np = np.array(input_image)
+        if input_np.ndim != 3 or input_np.shape[2] != 3:
+            print(f"Warning: Unexpected input image shape: {input_np.shape}, converting to RGB")
+            input_image = input_image.convert('RGB')
+            input_np = np.array(input_image)
+        
+        input_tensor = torch.from_numpy(input_np).permute(2, 0, 1).float().div(255.0).unsqueeze(0).to(device)
+    except Exception as e:
+        print(f"Error processing input image: {e}")
+        # Create a fallback red image if conversion fails
+        input_tensor = torch.zeros(1, 3, 1024, 1024, device=device)
+        input_tensor[0, 0, :, :] = 1.0  # Red channel
+
+    with torch.inference_mode():
+        with torch.autocast(
+            "cuda", enabled=True, dtype=torch.float16, cache_enabled=True
+        ):
+            # Convert input image to proper format for model
+            input_tensor = input_tensor.to(torch.float16)
+
+            (
+                context_tokens,
+                context_mask,
+                context_position_ids,
+                context_tensor,
+            ) = encode_prompts(
+                prompts,
+                text_model,
+                text_tokenizer,
+                args.max_token_length,
+                llm_system_prompt,
+                args.use_llm_system_prompt,
+            )
+
+            infer_func = model.autoregressive_infer_cfg
+
+            output_imgs = infer_func(
+                B=context_tensor.size(0),
+                label_B=context_tensor,
+                cfg=args.cfg,
+                g_seed=seed,
+                more_smooth=args.more_smooth,
+                context_position_ids=context_position_ids,
+                context_mask=context_mask,
+                input_image=input_tensor,
+                condition_scale=condition_scale,
+            )
+
+    # bs, 3, r, r
+    images = []
+    sample_imgs_np = output_imgs.clone().mul_(255).cpu().numpy()
+    num_imgs = sample_imgs_np.shape[0]
+    for img_idx in range(num_imgs):
+        cur_img = sample_imgs_np[img_idx]
+        cur_img = cur_img.transpose(1, 2, 0).astype(np.uint8)
+        cur_img_store = Image.fromarray(cur_img)
+        images.append(cur_img_store)
+
+    return images, seed
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -193,63 +291,133 @@ if __name__ == "__main__":
             elem_id="duplicate-button",
             visible=os.getenv("SHOW_DUPLICATE_BUTTON") == "1",
         )
-        with gr.Group():
-            with gr.Row():
-                prompt = gr.Text(
-                    label="Prompt",
-                    show_label=False,
-                    max_lines=1,
-                    placeholder="Enter your prompt",
-                    container=False,
-                )
-                run_button = gr.Button("Run", scale=0)
+        
+        with gr.Tabs():
+            with gr.TabItem("Text to Image"):
+                with gr.Group():
+                    with gr.Row():
+                        t2i_prompt = gr.Text(
+                            label="Prompt",
+                            show_label=False,
+                            max_lines=1,
+                            placeholder="Enter your prompt",
+                            container=False,
+                        )
+                        t2i_run_button = gr.Button("Run", scale=0)
 
-            result = gr.Gallery(
-                label="Result",
-                columns=NUM_IMAGES_PER_PROMPT,
-                show_label=False,
-                # height=800,
-            )
-            with gr.Accordion("Advanced options", open=False):
-                seed = gr.Slider(
-                    label="Seed",
-                    minimum=0,
-                    maximum=MAX_SEED,
-                    step=1,
-                    value=args.seed,
-                )
-                randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
-                with gr.Row():
-                    guidance_scale = gr.Slider(
-                        label="Guidance Scale",
-                        minimum=0.1,
-                        maximum=20,
-                        step=0.1,
-                        value=4.5,
+                    t2i_result = gr.Gallery(
+                        label="Result",
+                        columns=NUM_IMAGES_PER_PROMPT,
+                        show_label=False,
                     )
+                    with gr.Accordion("Advanced options", open=False):
+                        t2i_seed = gr.Slider(
+                            label="Seed",
+                            minimum=0,
+                            maximum=MAX_SEED,
+                            step=1,
+                            value=args.seed,
+                        )
+                        t2i_randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
+                        with gr.Row():
+                            t2i_guidance_scale = gr.Slider(
+                                label="Guidance Scale",
+                                minimum=0.1,
+                                maximum=20,
+                                step=0.1,
+                                value=4.5,
+                            )
 
-        gr.Examples(
-            examples=examples,
-            inputs=prompt,
-            outputs=[result, seed],
-            fn=generate,
-            cache_examples=CACHE_EXAMPLES,
-        )
+                gr.Examples(
+                    examples=examples,
+                    inputs=t2i_prompt,
+                    outputs=[t2i_result, t2i_seed],
+                    fn=generate,
+                    cache_examples=CACHE_EXAMPLES,
+                )
 
-        gr.on(
-            triggers=[
-                prompt.submit,
-                run_button.click,
-            ],
-            fn=generate,
-            inputs=[
-                prompt,
-                seed,
-                guidance_scale,
-                randomize_seed,
-            ],
-            outputs=[result, seed],
-            api_name="run",
-        )
+                gr.on(
+                    triggers=[
+                        t2i_prompt.submit,
+                        t2i_run_button.click,
+                    ],
+                    fn=generate,
+                    inputs=[
+                        t2i_prompt,
+                        t2i_seed,
+                        t2i_guidance_scale,
+                        t2i_randomize_seed,
+                    ],
+                    outputs=[t2i_result, t2i_seed],
+                    api_name="run_t2i",
+                )
+            
+            with gr.TabItem("Image to Image"):
+                with gr.Group():
+                    with gr.Row():
+                        i2i_prompt = gr.Text(
+                            label="Prompt",
+                            show_label=False,
+                            max_lines=1,
+                            placeholder="Describe the changes you want to make to the image",
+                            container=False,
+                        )
+                        i2i_run_button = gr.Button("Run", scale=0)
+                    
+                    i2i_input_image = gr.Image(
+                        label="Input Image", 
+                        type="pil", 
+                        height=384
+                    )
+                    
+                    i2i_result = gr.Gallery(
+                        label="Result",
+                        columns=NUM_IMAGES_PER_PROMPT,
+                        show_label=False,
+                    )
+                    
+                    with gr.Accordion("Advanced options", open=False):
+                        i2i_condition_scale = gr.Slider(
+                            label="Conditioning Scale",
+                            minimum=0.0,
+                            maximum=1.0,
+                            step=0.05,
+                            value=0.7,
+                            info="How much to preserve from the original image (higher = more faithful to original)"
+                        )
+                        i2i_seed = gr.Slider(
+                            label="Seed",
+                            minimum=0,
+                            maximum=MAX_SEED,
+                            step=1,
+                            value=args.seed,
+                        )
+                        i2i_randomize_seed = gr.Checkbox(label="Randomize seed", value=True)
+                        with gr.Row():
+                            i2i_guidance_scale = gr.Slider(
+                                label="Guidance Scale",
+                                minimum=0.1,
+                                maximum=20,
+                                step=0.1,
+                                value=4.5,
+                            )
+                
+                gr.on(
+                    triggers=[
+                        i2i_prompt.submit,
+                        i2i_run_button.click,
+                    ],
+                    fn=generate_img2img,
+                    inputs=[
+                        i2i_prompt,
+                        i2i_input_image,
+                        i2i_condition_scale,
+                        i2i_seed,
+                        i2i_guidance_scale,
+                        i2i_randomize_seed,
+                    ],
+                    outputs=[i2i_result, i2i_seed],
+                    api_name="run_i2i",
+                )
 
     demo.queue(max_size=20).launch(share=True)
